@@ -1,24 +1,57 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
-import { Citizen } from '@/lib/types';
-import { getDepartmentOptions, getAreasByDepartment } from '@/lib/departments';
+import { useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
+import type { Citizen } from "@/lib/types";
+
+type ResultadoLlamada =
+  | "pendiente"
+  | "exito"
+  | "no_contestada"
+  | "vuelta_mesa_ayuda";
+
+type DatosAtencion = {
+  subject: string;
+  description: string;
+  department?: string;
+  area?: string;
+  staff?: string;
+  attentionMode?: "normal" | "llamada_transferida";
+  callOutcome?: ResultadoLlamada;
+  pendingInformation?: boolean;
+};
 
 interface Step3CreateTicketProps {
   citizen: Citizen;
-  ticketType: 'consulta' | 'requerimiento';
-  onSubmit: (data: {
-    subject: string;
-    description: string;
-    department?: string;
-    area?: string;
-    staff?: string;
-    attentionMode?: 'normal' | 'llamada_transferida';
-    callOutcome?: 'exito' | 'no_contestada' | 'vuelta_mesa_ayuda';
-    pendingInformation?: boolean;
-  }) => void;
+  ticketType: "consulta" | "requerimiento";
+  onSubmit: (data: DatosAtencion) => void | Promise<void>;
   onBack: () => void;
 }
+
+type Departamento = {
+  id: number;
+  nombre: string;
+};
+
+type Formulario = {
+  subject: string;
+  description: string;
+  department: string;
+  area: string;
+  attentionMode: "normal" | "llamada_transferida";
+  callOutcome: ResultadoLlamada;
+  pendingInformation: boolean;
+};
+
+const MOTIVOS_CONSULTA = [
+  "Horarios de atención",
+  "Requisitos para trámites",
+  "Información de programas municipales",
+  "Otro",
+];
+
+const CLASE_CAMPO =
+  "mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-60";
 
 export function Step3CreateTicket({
   citizen,
@@ -26,281 +59,669 @@ export function Step3CreateTicket({
   onSubmit,
   onBack,
 }: Step3CreateTicketProps) {
-  const [formData, setFormData] = useState({
-    subject: '',
-    description: '',
-    department: '',
-    area: '',
-    staff: '',
-    attentionMode: 'normal' as 'normal' | 'llamada_transferida',
-    callOutcome: 'exito' as 'exito' | 'no_contestada' | 'vuelta_mesa_ayuda',
+  const esConsulta = ticketType === "consulta";
+  const esAnonimo = String(citizen.id).startsWith("anon-");
+
+  const ciudadano = citizen as Citizen & {
+    nombre?: string;
+    apellido?: string;
+  };
+
+  const nombreCiudadano = esAnonimo
+    ? "Anónimo"
+    : ciudadano.name ||
+      [ciudadano.nombre, ciudadano.apellido]
+        .filter(Boolean)
+        .join(" ") ||
+      "Ciudadano registrado";
+
+  const [formData, setFormData] = useState<Formulario>({
+    subject: "",
+    description: "",
+    department: "",
+    area: "",
+    attentionMode: "normal",
+    callOutcome: "pendiente",
     pendingInformation: false,
   });
 
-  const anonymousConsultaOptions = [
-    'Horarios de atención',
-    'Requisitos para trámites',
-    'Información de programas municipales',
-    'Consultas generales',
-  ];
+  const [departamentos, setDepartamentos] = useState<Departamento[]>([]);
+  const [cargandoDepartamentos, setCargandoDepartamentos] = useState(true);
+  const [errorDepartamentos, setErrorDepartamentos] = useState("");
+  const [intentoCatalogo, setIntentoCatalogo] = useState(0);
 
-  const isAnonymous = String(citizen?.id || '').startsWith('anon-');
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [guardando, setGuardando] = useState(false);
+  const [errorEnvio, setErrorEnvio] = useState("");
 
-  const departments = getDepartmentOptions();
-  const areas = formData.department ? getAreasByDepartment(formData.department) : [];
+  const envioEnCurso = useRef(false);
 
-  // Determinamos si la descripción es obligatoria según la regla solicitada
-// Función helper dentro de Step3CreateTicket
-const isDescriptionRequired = () => {
-  if (isAnonymous && ticketType === 'consulta') {
-    return formData.subject.trim().toLowerCase() === 'consultas generales';
-  }
-  return true; // Para registrado o requerimiento siempre es obligatoria
-};
+  useEffect(() => {
+    const controlador = new AbortController();
 
-  const validateForm = () => {
-    const newErrors: Record<string, string> = {};
+    setCargandoDepartamentos(true);
+    setErrorDepartamentos("");
 
-    if (!formData.subject.trim()) {
-      newErrors.subject = 'El asunto es requerido';
+    async function cargarDepartamentos() {
+      try {
+        const respuesta = await fetch("/api/ti/departamentos", {
+          cache: "no-store",
+          signal: controlador.signal,
+        });
+
+        const datos = await respuesta.json();
+
+        if (
+          !respuesta.ok ||
+          datos?.ok !== true ||
+          !Array.isArray(datos.departamentos)
+        ) {
+          throw new Error(
+            datos?.mensaje ||
+              datos?.error ||
+              "No se pudieron cargar los departamentos."
+          );
+        }
+
+        const catalogoValido = datos.departamentos.every(
+          (departamento: unknown) => {
+            if (
+              !departamento ||
+              typeof departamento !== "object"
+            ) {
+              return false;
+            }
+
+            const item = departamento as Departamento;
+
+            return (
+              Number.isSafeInteger(item.id) &&
+              item.id > 0 &&
+              typeof item.nombre === "string" &&
+              item.nombre.trim().length > 0
+            );
+          }
+        );
+
+        if (!catalogoValido) {
+          throw new Error(
+            "El servidor devolvió un catálogo de departamentos inválido."
+          );
+        }
+
+        if (controlador.signal.aborted) return;
+
+        setDepartamentos(datos.departamentos);
+      } catch (error: unknown) {
+        if (controlador.signal.aborted) return;
+
+        setErrorDepartamentos(
+          error instanceof Error
+            ? error.message
+            : "No se pudieron cargar los departamentos."
+        );
+      } finally {
+        if (!controlador.signal.aborted) {
+          setCargandoDepartamentos(false);
+        }
+      }
     }
 
-    if (isDescriptionRequired() && !formData.description.trim()) {
-      newErrors.description = 'La descripción es requerida';
+    void cargarDepartamentos();
+
+    return () => controlador.abort();
+  }, [intentoCatalogo]);
+
+  const descripcionObligatoria =
+    !esConsulta || formData.subject === "Otro";
+
+  const catalogoNoDisponible =
+    cargandoDepartamentos ||
+    !!errorDepartamentos ||
+    departamentos.length === 0;
+
+  function limpiarError(campo: string) {
+    setErrors((actuales) => ({
+      ...actuales,
+      [campo]: "",
+    }));
+  }
+
+  function validar() {
+    const nuevosErrores: Record<string, string> = {};
+
+    if (!esConsulta && esAnonimo) {
+      nuevosErrores.citizen =
+        "Para registrar un requerimiento debe identificar al ciudadano.";
+    }
+
+    if (!formData.subject.trim()) {
+      nuevosErrores.subject = esConsulta
+        ? "Seleccione el motivo de la consulta."
+        : "Ingrese el asunto del requerimiento.";
+    } else if (
+      esConsulta &&
+      !MOTIVOS_CONSULTA.includes(formData.subject)
+    ) {
+      nuevosErrores.subject = "Seleccione un motivo válido.";
+    }
+
+    if (descripcionObligatoria && !formData.description.trim()) {
+      nuevosErrores.description = "Ingrese una descripción.";
     }
 
     if (!formData.department) {
-      newErrors.department = 'Debe seleccionar un departamento';
+      nuevosErrores.department = "Seleccione un departamento.";
+    } else if (
+      !departamentos.some(
+        (departamento) =>
+          String(departamento.id) === formData.department
+      )
+    ) {
+      nuevosErrores.department =
+        "Seleccione un departamento disponible.";
     }
 
-    if (ticketType !== 'consulta') {
-      if (!formData.area) newErrors.area = 'Debe seleccionar un área';
+    if (!esConsulta && !formData.area.trim()) {
+      nuevosErrores.area = "Ingrese el área del requerimiento.";
     }
 
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
+    setErrors(nuevosErrores);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!validateForm()) return;
+    return Object.keys(nuevosErrores).length === 0;
+  }
 
-    // Si la descripción no es obligatoria y se dejó vacía, usaremos el mismo asunto como detalle por defecto
-    const finalDescription = formData.description.trim() || formData.subject;
+  async function handleSubmit(evento: FormEvent<HTMLFormElement>) {
+    evento.preventDefault();
 
-    onSubmit({
-      subject: formData.subject,
-      description: finalDescription,
-      department: formData.department,
-      area: ticketType !== 'consulta' ? formData.area : undefined,
-      staff: undefined,
-      attentionMode: ticketType === 'requerimiento' ? formData.attentionMode : undefined,
-      callOutcome:
-        ticketType === 'requerimiento' && formData.attentionMode === 'llamada_transferida'
-          ? formData.callOutcome
-          : undefined,
-      pendingInformation: ticketType === 'requerimiento' ? formData.pendingInformation : undefined,
-    });
-  };
+    if (
+      envioEnCurso.current ||
+      catalogoNoDisponible ||
+      !validar()
+    ) {
+      return;
+    }
+
+    envioEnCurso.current = true;
+    setGuardando(true);
+    setErrorEnvio("");
+
+    try {
+      await onSubmit({
+        subject: formData.subject.trim(),
+        description:
+          formData.description.trim() || formData.subject.trim(),
+        department: formData.department,
+        area: esConsulta ? undefined : formData.area.trim(),
+        attentionMode: esConsulta
+          ? undefined
+          : formData.attentionMode,
+        callOutcome:
+          !esConsulta &&
+          formData.attentionMode === "llamada_transferida"
+            ? formData.callOutcome
+            : undefined,
+        pendingInformation: esConsulta
+          ? undefined
+          : formData.pendingInformation,
+      });
+    } catch (error: unknown) {
+      setErrorEnvio(
+        error instanceof Error
+          ? error.message
+          : "No se pudo registrar la atención."
+      );
+    } finally {
+      envioEnCurso.current = false;
+      setGuardando(false);
+    }
+  }
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-foreground">
-          {ticketType === 'consulta' ? 'Nueva Consulta' : 'Nuevo Requerimiento'}
+          {esConsulta ? "Nueva Consulta" : "Nuevo Requerimiento"}
         </h2>
+
         <p className="mt-2 text-muted-foreground">
-          Complete los detalles para {citizen.name || (citizen as any).nombre}
+          {esConsulta
+            ? "Registre la consulta atendida por teléfono."
+            : "Complete los detalles del requerimiento."}
         </p>
       </div>
 
       <div className="rounded-lg bg-secondary/30 p-4">
         <p className="text-sm text-foreground">
-          <span className="font-medium">Ciudadano:</span> {citizen.name || (citizen as any).nombre}
+          <span className="font-medium">Ciudadano:</span>{" "}
+          {nombreCiudadano}
         </p>
+
+        {esAnonimo && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            La atención se guardará sin asociar datos personales.
+          </p>
+        )}
       </div>
 
-      <div className="space-y-4">
+      {errors.citizen && (
+        <p
+          role="alert"
+          className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+        >
+          {errors.citizen}
+        </p>
+      )}
+
+      {errorEnvio && (
+        <p
+          role="alert"
+          className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+        >
+          {errorEnvio}
+        </p>
+      )}
+
+      <fieldset disabled={guardando} className="min-w-0 space-y-4">
         <div>
-          <label className="block text-sm font-medium text-foreground">Asunto *</label>
-          {isAnonymous && ticketType === 'consulta' ? (
+          <label
+            htmlFor="atencion-asunto"
+            className="block text-sm font-medium text-foreground"
+          >
+            {esConsulta ? "Motivo de la consulta *" : "Asunto *"}
+          </label>
+
+          {esConsulta ? (
             <select
+              id="atencion-asunto"
               value={formData.subject}
-              onChange={(e) => {
-                setFormData({ ...formData, subject: e.target.value });
-                if (errors.subject) setErrors({ ...errors, subject: '' });
-                if (errors.description) setErrors({ ...errors, description: '' });
+              onChange={(evento) => {
+                const valor = evento.target.value;
+
+                setFormData((actual) => ({
+                  ...actual,
+                  subject: valor,
+                }));
+
+                limpiarError("subject");
+                limpiarError("description");
               }}
-              className="mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+              className={CLASE_CAMPO}
+              aria-invalid={!!errors.subject}
+              aria-describedby={
+                errors.subject ? "error-asunto" : undefined
+              }
             >
-              <option value="">Seleccione el motivo de la consulta</option>
-              {anonymousConsultaOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
+              <option value="">
+                Seleccione el motivo de la consulta
+              </option>
+
+              {MOTIVOS_CONSULTA.map((motivo) => (
+                <option key={motivo} value={motivo}>
+                  {motivo}
                 </option>
               ))}
             </select>
           ) : (
             <input
+              id="atencion-asunto"
               type="text"
+              maxLength={50}
               value={formData.subject}
-              onChange={(e) => {
-                setFormData({ ...formData, subject: e.target.value });
-                if (errors.subject) setErrors({ ...errors, subject: '' });
+              onChange={(evento) => {
+                const valor = evento.target.value;
+
+                setFormData((actual) => ({
+                  ...actual,
+                  subject: valor,
+                }));
+
+                limpiarError("subject");
               }}
-              className="mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground placeholder-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
-              placeholder="Ingrese el asunto del ticket"
+              placeholder="Ingrese el asunto del requerimiento"
+              className={CLASE_CAMPO}
+              aria-invalid={!!errors.subject}
+              aria-describedby={
+                errors.subject ? "error-asunto" : undefined
+              }
             />
           )}
-          {errors.subject && <p className="mt-1 text-sm text-red-500">{errors.subject}</p>}
+
+          <p className="mt-1 text-right text-xs text-muted-foreground">
+  {formData.subject.length} / 50 caracteres
+</p>
+
+          {errors.subject && (
+            <p
+              id="error-asunto"
+              className="mt-1 text-sm text-red-600"
+            >
+              {errors.subject}
+            </p>
+          )}
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-foreground">
-            Descripción {isDescriptionRequired() ? '*' : '(Opcional)'}
+          <label
+            htmlFor="atencion-descripcion"
+            className="block text-sm font-medium text-foreground"
+          >
+            Descripción {descripcionObligatoria ? "*" : "(opcional)"}
           </label>
+
           <textarea
+            id="atencion-descripcion"
             value={formData.description}
-            onChange={(e) => {
-              setFormData({ ...formData, description: e.target.value });
-              if (errors.description) setErrors({ ...errors, description: '' });
+            maxLength={200}
+            onChange={(evento) => {
+              const valor = evento.target.value;
+
+              setFormData((actual) => ({
+                ...actual,
+                description: valor,
+              }));
+
+              limpiarError("description");
             }}
-            className="mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground placeholder-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
             placeholder={
-              isDescriptionRequired()
-                ? 'Describa la consulta en detalle'
-                : 'Describa la consulta en detalle (opcional)'
+              esConsulta
+                ? "Puede indicar qué preguntó la persona y qué información se le entregó."
+                : "Describa el requerimiento."
             }
-            rows={5}
+            rows={4}
+            className={CLASE_CAMPO}
+            aria-invalid={!!errors.description}
+            aria-describedby={
+              errors.description ? "error-descripcion" : undefined
+            }
           />
-          {errors.description && <p className="mt-1 text-sm text-red-500">{errors.description}</p>}
+
+          <p className="mt-1 text-right text-xs text-muted-foreground">
+  {formData.description.length} / 200 caracteres
+</p>
+
+          {errors.description && (
+            <p
+              id="error-descripcion"
+              className="mt-1 text-sm text-red-600"
+            >
+              {errors.description}
+            </p>
+          )}
         </div>
 
-        {ticketType === 'requerimiento' && !isAnonymous && (
+        {!esConsulta && !esAnonimo && (
           <div className="rounded-lg border border-border bg-secondary/20 p-4">
-            <label className="flex cursor-pointer items-center gap-3 text-sm font-medium text-foreground">
+            <label
+              htmlFor="atencion-transferida"
+              className="flex cursor-pointer items-center gap-3 text-sm font-medium text-foreground"
+            >
               <input
+                id="atencion-transferida"
                 type="checkbox"
-                checked={formData.attentionMode === 'llamada_transferida'}
-                onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    attentionMode: e.target.checked ? 'llamada_transferida' : 'normal',
-                    callOutcome: 'exito',
-                  })
+                checked={
+                  formData.attentionMode === "llamada_transferida"
                 }
-                className="h-4 w-4 rounded border-input text-primary focus:ring-ring"
+                onChange={(evento) => {
+                  const marcada = evento.target.checked;
+
+                  setFormData((actual) => ({
+                    ...actual,
+                    attentionMode: marcada
+                      ? "llamada_transferida"
+                      : "normal",
+                    callOutcome: "pendiente",
+                  }));
+                }}
+                className="h-4 w-4"
               />
+
               Llamada transferida
             </label>
-            {formData.attentionMode === 'llamada_transferida' && (
-              <div className="mt-4 space-y-4">
-                <label className="block text-sm font-medium text-foreground">
-                  Resultado de la llamada *
-                </label>
-                <select
-                  value={formData.callOutcome}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      callOutcome: e.target.value as typeof formData.callOutcome,
-                    })
-                  }
-                  className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
-                >
-                  <option value="exito">Llamada transferida con éxito</option>
-                  <option value="no_contestada">No contestada</option>
-                  <option value="vuelta_mesa_ayuda">Llamada vuelta a mesa de ayuda</option>
-                </select>
-              </div>
-            )}
+
+            {formData.attentionMode === "llamada_transferida" && (
+  <div className="mt-4">
+    <label
+      htmlFor="atencion-resultado"
+      className="block text-sm font-medium text-foreground"
+    >
+      Resultado de la llamada *
+    </label>
+
+    <select
+      id="atencion-resultado"
+      value={formData.callOutcome}
+      onChange={(evento) => {
+        const resultado =
+          evento.target.value as ResultadoLlamada;
+
+        setFormData((actual) => ({
+          ...actual,
+          callOutcome: resultado,
+        }));
+      }}
+      className={CLASE_CAMPO}
+    >
+      <option value="pendiente">
+        Pendiente de confirmar
+      </option>
+      <option value="exito">
+        Llamada transferida con éxito
+      </option>
+      <option value="no_contestada">
+        No contestada
+      </option>
+      <option value="vuelta_mesa_ayuda">
+        Llamada vuelta a mesa de ayuda
+      </option>
+    </select>
+  </div>
+)}
           </div>
         )}
 
-        {ticketType === 'requerimiento' && (
-          <div className="rounded-lg border border-orange-200 bg-orange-50/60 p-4 dark:border-orange-900 dark:bg-orange-950/20">
-            <label className="flex cursor-pointer items-center gap-3 text-sm font-medium text-foreground">
+        {!esConsulta && (
+          <div className="rounded-lg border border-orange-200 bg-orange-50/60 p-4">
+            <label
+              htmlFor="atencion-pendiente"
+              className="flex cursor-pointer items-center gap-3 text-sm font-medium text-slate-800"
+            >
               <input
+                id="atencion-pendiente"
                 type="checkbox"
                 checked={formData.pendingInformation}
-                onChange={(e) =>
-                  setFormData({ ...formData, pendingInformation: e.target.checked })
-                }
-                className="h-4 w-4 rounded border-input text-primary focus:ring-ring"
+                onChange={(evento) => {
+                  const marcada = evento.target.checked;
+
+                  setFormData((actual) => ({
+                    ...actual,
+                    pendingInformation: marcada,
+                  }));
+                }}
+                className="h-4 w-4"
               />
+
               Pendiente de información
             </label>
-            <p className="mt-2 pl-7 text-sm text-muted-foreground">
-              El requerimiento quedará en proceso para completar los antecedentes pendientes.
+
+            <p className="mt-2 text-xs text-slate-600">
+              Se dejará constancia de que faltan antecedentes.
+              El requerimiento se registrará abierto.
             </p>
           </div>
         )}
 
         <div>
-          <label className="block text-sm font-medium text-foreground">
-            Departamento a{' '}
-            {ticketType === 'requerimiento' && formData.attentionMode === 'llamada_transferida'
-              ? 'derivar'
-              : 'consultar'}{' '}
-            *
-          </label>
-          <select
-            value={formData.department}
-            onChange={(e) => {
-              setFormData({ ...formData, department: e.target.value, area: '', staff: '' });
-              if (errors.department) setErrors({ ...errors, department: '' });
-            }}
-            className="mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+          <label
+            htmlFor="atencion-departamento"
+            className="block text-sm font-medium text-foreground"
           >
-            <option value="">Seleccione un departamento</option>
-            {departments.map((dept) => (
-              <option key={dept} value={dept}>
-                {dept}
+            {esConsulta
+              ? "Departamento relacionado con la consulta *"
+              : "Departamento a derivar *"}
+          </label>
+
+          <select
+            id="atencion-departamento"
+            value={formData.department}
+            disabled={catalogoNoDisponible}
+            onChange={(evento) => {
+              const valor = evento.target.value;
+
+              setFormData((actual) => ({
+                ...actual,
+                department: valor,
+                area: "",
+              }));
+
+              limpiarError("department");
+              limpiarError("area");
+            }}
+            className={CLASE_CAMPO}
+            aria-invalid={!!errors.department}
+            aria-describedby={
+              errors.department ? "error-departamento" : undefined
+            }
+          >
+            <option value="">
+              {cargandoDepartamentos
+                ? "Cargando departamentos…"
+                : "Seleccione un departamento"}
+            </option>
+
+            {departamentos.map((departamento) => (
+              <option
+                key={departamento.id}
+                value={String(departamento.id)}
+              >
+                {departamento.nombre}
               </option>
             ))}
           </select>
-          {errors.department && <p className="mt-1 text-sm text-red-500">{errors.department}</p>}
+
+          {errors.department && (
+            <p
+              id="error-departamento"
+              className="mt-1 text-sm text-red-600"
+            >
+              {errors.department}
+            </p>
+          )}
+
+          {errorDepartamentos && (
+            <div
+              role="alert"
+              className="mt-2 text-sm text-red-700"
+            >
+              <p>{errorDepartamentos}</p>
+
+              <button
+                type="button"
+                onClick={() =>
+                  setIntentoCatalogo((actual) => actual + 1)
+                }
+                className="mt-1 font-semibold underline"
+              >
+                Reintentar carga
+              </button>
+            </div>
+          )}
+
+          {!cargandoDepartamentos &&
+            !errorDepartamentos &&
+            departamentos.length === 0 && (
+              <p
+                role="status"
+                className="mt-2 text-sm text-amber-700"
+              >
+                No hay departamentos disponibles para registrar
+                la atención.
+              </p>
+            )}
+
+          {esConsulta && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Indica a qué departamento corresponde la información.
+              Esto no transfiere la llamada.
+            </p>
+          )}
         </div>
 
-        {ticketType !== 'consulta' && formData.department && (
+        {!esConsulta && formData.department && (
           <div>
-            <label className="block text-sm font-medium text-foreground">Área *</label>
-            <select
-              value={formData.area}
-              onChange={(e) => {
-                setFormData({ ...formData, area: e.target.value, staff: '' });
-                if (errors.area) setErrors({ ...errors, area: '' });
-              }}
-              className="mt-2 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-ring"
+            <label
+              htmlFor="atencion-area"
+              className="block text-sm font-medium text-foreground"
             >
-              <option value="">Seleccione un área</option>
-              {areas.map((area) => (
-                <option key={area} value={area}>
-                  {area}
-                </option>
-              ))}
-            </select>
-            {errors.area && <p className="mt-1 text-sm text-red-500">{errors.area}</p>}
+              Área *
+            </label>
+
+            <input
+              id="atencion-area"
+              type="text"
+              maxLength={150}
+              value={formData.area}
+              onChange={(evento) => {
+                const valor = evento.target.value;
+
+                setFormData((actual) => ({
+                  ...actual,
+                  area: valor,
+                }));
+
+                limpiarError("area");
+              }}
+              placeholder="Ingrese el área dentro del departamento"
+              className={CLASE_CAMPO}
+              aria-invalid={!!errors.area}
+              aria-describedby={
+                errors.area ? "error-area" : undefined
+              }
+            />
+
+            {errors.area && (
+              <p
+                id="error-area"
+                className="mt-1 text-sm text-red-600"
+              >
+                {errors.area}
+              </p>
+            )}
           </div>
         )}
-      </div>
 
-      <div className="flex gap-3">
-        <button
-          type="button"
-          onClick={onBack}
-          className="flex-1 rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
-        >
-          Atrás
-        </button>
-        <button
-          type="submit"
-          className="flex-1 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-        >
-          {ticketType === 'consulta' ? 'Registro de Consulta' : 'Registro de Requerimiento'}
-        </button>
-      </div>
+        <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 text-sm text-blue-800">
+          {esConsulta
+            ? "La consulta quedará cerrada automáticamente como una atención respondida durante la llamada."
+            : "El requerimiento quedará abierto para su gestión y seguimiento."}
+        </div>
+
+        <div className="flex gap-3 pt-2">
+          <button
+            type="button"
+            onClick={onBack}
+            className="flex-1 rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary disabled:opacity-50"
+          >
+            Atrás
+          </button>
+
+          <button
+            type="submit"
+            disabled={
+              guardando ||
+              catalogoNoDisponible ||
+              (!esConsulta && esAnonimo)
+            }
+            className="flex-1 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {guardando
+              ? "Guardando…"
+              : esConsulta
+                ? "Registrar consulta"
+                : "Registrar requerimiento"}
+          </button>
+        </div>
+      </fieldset>
     </form>
   );
 }

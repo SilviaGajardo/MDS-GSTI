@@ -1,48 +1,68 @@
-'use client';
+"use client";
 
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
-import { 
-  Eye, 
-  X, 
-  User, 
-  UserX, 
-  Calendar, 
-  AlertCircle, 
-  Clock, 
-  CheckCircle, 
-  MessageSquarePlus, 
-  History, 
-  Send 
-} from 'lucide-react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import type { FormEvent } from "react";
+import {
+  Eye,
+  X,
+  Calendar,
+  History,
+  Send,
+  MessageSquarePlus,
+} from "lucide-react";
+
+type Estado = "abierto" | "en_proceso" | "cerrado";
+
+type ResultadoTransferencia =
+  | "pendiente"
+  | "exito"
+  | "no_contestada"
+  | "devuelta";
 
 export interface Ticket {
   id: number | string;
   numero_ticket?: string;
   asunto?: string;
   subject?: string;
-  detalles?: string;
-  descripcion?: string;
-  description?: string;
+  detalles?: string | null;
+  descripcion?: string | null;
+  description?: string | null;
   ciudadano?: string;
   citizenName?: string;
-  agente?: string;
-  departamento?: string;
+  agente?: string | null;
+  departamento?: string | null;
   department?: string;
   tipo_llamada?: string;
   ticketType?: string;
   estado?: string;
   status?: string;
   es_anonimo?: number | boolean;
+  estado_transferencia?: ResultadoTransferencia | null;
   fecha_creacion?: string;
+  fecha_cierre?: string | null;
 }
 
 interface HistorialItem {
   id: number;
-  estado_anterior: string;
+  tipo_evento?: string;
+  estado_anterior: string | null;
   estado_nuevo: string;
   comentario: string;
   fecha_registro: string;
-  agente: string;
+  agente: string | null;
+  departamento_anterior_nombre?: string | null;
+  departamento_nuevo_nombre?: string | null;
+}
+
+interface RespuestaDetalle {
+  success: boolean;
+  ticket: Ticket;
+  historial: HistorialItem[];
 }
 
 interface TicketDetailModalProps {
@@ -51,390 +71,807 @@ interface TicketDetailModalProps {
   onTicketUpdated?: () => void;
 }
 
-export function TicketDetailModal({ ticket, onClose, onTicketUpdated }: TicketDetailModalProps) {
-  const [fullTicket, setFullTicket] = useState<Ticket | null>(ticket);
-  const [historial, setHistorial] = useState<HistorialItem[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
+const ESTADOS: Record<
+  Estado,
+  { nombre: string; clase: string }
+> = {
+  abierto: {
+    nombre: "Abierto",
+    clase: "bg-amber-100 text-amber-800",
+  },
+  en_proceso: {
+    nombre: "En proceso",
+    clase: "bg-blue-100 text-blue-800",
+  },
+  cerrado: {
+    nombre: "Cerrado",
+    clase: "bg-emerald-100 text-emerald-800",
+  },
+};
 
-  // Formulario de avances
-  const [nuevoEstado, setNuevoEstado] = useState<string>('en_proceso');
-  const [comentarioAvance, setComentarioAvance] = useState<string>('');
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [mensajeExito, setMensajeExito] = useState<string | null>(null);
+const TRANSFERENCIAS: Record<ResultadoTransferencia, string> = {
+  pendiente: "Pendiente de confirmar",
+  exito: "Llamada transferida con éxito",
+  no_contestada: "No contestada",
+  devuelta: "Llamada vuelta a mesa de ayuda",
+};
 
-  // Extraer el identificador primario para consultas SQL
-  const targetId = useMemo(() => {
-    if (!ticket) return null;
-    return ticket.id ?? ticket.numero_ticket ?? null;
-  }, [ticket]);
+const EVENTOS: Record<string, string> = {
+  creacion: "Creación de la atención",
+  seguimiento: "Seguimiento",
+  cambio_estado: "Cambio de estado",
+  derivacion: "Derivación",
+  anonimizacion: "Desvinculación del ciudadano",
+};
 
-  // Cerrar modal con tecla Escape
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onClose]);
+const CLASE_CAMPO =
+  "mt-1 w-full rounded-md border border-slate-300 bg-white p-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60";
 
-  // Cargar detalles completos e historial directamente desde MySQL
-  const fetchTicketDetails = useCallback(async (id: string | number, signal?: AbortSignal) => {
-    setLoading(true);
-    try {
-      const response = await fetch(`/api/tickets/${id}`, { signal });
-      if (response.ok) {
-        const data = await response.json();
-        const resultTicket = data.ticket || data.data || data;
-        setFullTicket(resultTicket);
-        setHistorial(data.historial || []);
+function normalizarEstado(valor: unknown): Estado | null {
+  const estado = String(valor ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
 
-        if (resultTicket?.estado) {
-          setNuevoEstado(resultTicket.estado.toLowerCase().replace(' ', '_'));
-        }
-      } else {
-        setFullTicket(ticket);
-      }
-    } catch (error: any) {
-      if (error.name !== 'AbortError') {
-        console.error('Error al obtener el detalle del ticket:', error);
-        setFullTicket(ticket);
-      }
-    } finally {
-      setLoading(false);
+  return estado === "abierto" ||
+    estado === "en_proceso" ||
+    estado === "cerrado"
+    ? estado
+    : null;
+}
+
+function esResultadoTransferencia(
+  valor: unknown
+): valor is ResultadoTransferencia {
+  return (
+    valor === "pendiente" ||
+    valor === "exito" ||
+    valor === "no_contestada" ||
+    valor === "devuelta"
+  );
+}
+
+function mostrarEstado(valor: string | null) {
+  if (!valor) return "Inicio";
+
+  const estado = normalizarEstado(valor);
+
+  return estado ? ESTADOS[estado].nombre : valor;
+}
+
+function mostrarFecha(valor?: string | null) {
+  if (!valor) return "—";
+
+  const fecha = new Date(valor);
+
+  if (Number.isNaN(fecha.getTime())) return "—";
+
+  return fecha.toLocaleString("es-CL", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+async function leerDetalle(
+  id: string,
+  signal: AbortSignal
+): Promise<RespuestaDetalle> {
+  const respuesta = await fetch(
+    `/api/tickets/${encodeURIComponent(id)}`,
+    {
+      cache: "no-store",
+      signal,
     }
-  }, [ticket]);
+  );
 
-  // Cargar datos cuando cambia el ticket
+  const datos = await respuesta.json();
+
+  if (!respuesta.ok || datos?.success !== true) {
+    throw new Error(
+      datos?.error ||
+        datos?.message ||
+        "No se pudo consultar el ticket."
+    );
+  }
+
+  if (
+    !datos.ticket ||
+    String(datos.ticket.id) !== id ||
+    !normalizarEstado(datos.ticket.estado) ||
+    !Array.isArray(datos.historial)
+  ) {
+    throw new Error("El servidor devolvió un detalle inválido.");
+  }
+
+  const transferencia = datos.ticket.estado_transferencia;
+
+  if (
+    transferencia !== undefined &&
+    transferencia !== null &&
+    !esResultadoTransferencia(transferencia)
+  ) {
+    throw new Error(
+      "El servidor devolvió un resultado de transferencia inválido."
+    );
+  }
+
+  return datos;
+}
+
+export function TicketDetailModal({
+  ticket,
+  onClose,
+  onTicketUpdated,
+}: TicketDetailModalProps) {
+  if (!ticket) return null;
+
+  return (
+    <ContenidoModal
+      key={String(ticket.id)}
+      ticket={ticket}
+      onClose={onClose}
+      onTicketUpdated={onTicketUpdated}
+    />
+  );
+}
+
+function ContenidoModal({
+  ticket,
+  onClose,
+  onTicketUpdated,
+}: {
+  ticket: Ticket;
+  onClose: () => void;
+  onTicketUpdated?: () => void;
+}) {
+  const id = String(ticket.id);
+
+  const dialogo = useRef<HTMLDialogElement>(null);
+  const guardandoRef = useRef(false);
+  const controladorGuardado = useRef<AbortController | null>(null);
+
+  const [fullTicket, setFullTicket] = useState<Ticket | null>(null);
+  const [historial, setHistorial] = useState<HistorialItem[]>([]);
+  const [cargando, setCargando] = useState(true);
+  const [guardando, setGuardando] = useState(false);
+  const [error, setError] = useState("");
+  const [mensajeExito, setMensajeExito] = useState("");
+  const [intento, setIntento] = useState(0);
+
+  const [nuevoEstado, setNuevoEstado] = useState<Estado>("abierto");
+  const [comentario, setComentario] = useState("");
+  const [llamadaTransferida, setLlamadaTransferida] = useState(false);
+  const [resultadoTransferencia, setResultadoTransferencia] =
+    useState<ResultadoTransferencia>("pendiente");
+
   useEffect(() => {
-    if (!targetId) {
-      setFullTicket(null);
-      setHistorial([]);
+    const elemento = dialogo.current;
+
+    if (elemento && !elemento.open) {
+      elemento.showModal();
+    }
+
+    return () => {
+      controladorGuardado.current?.abort();
+      elemento?.close();
+    };
+  }, []);
+
+  const aplicarDetalle = useCallback((datos: RespuestaDetalle) => {
+    setFullTicket(datos.ticket);
+    setHistorial(datos.historial);
+    setNuevoEstado(
+      normalizarEstado(datos.ticket.estado) || "abierto"
+    );
+
+    const transferencia =
+      datos.ticket.estado_transferencia ?? null;
+
+    setLlamadaTransferida(transferencia !== null);
+    setResultadoTransferencia(transferencia || "pendiente");
+  }, []);
+
+  useEffect(() => {
+    const controlador = new AbortController();
+
+    setCargando(true);
+    setError("");
+    setMensajeExito("");
+    setFullTicket(null);
+    setHistorial([]);
+
+    void leerDetalle(id, controlador.signal)
+      .then((datos) => {
+        if (!controlador.signal.aborted) {
+          aplicarDetalle(datos);
+        }
+      })
+      .catch((errorConsulta: unknown) => {
+        if (controlador.signal.aborted) return;
+
+        setError(
+          errorConsulta instanceof Error
+            ? errorConsulta.message
+            : "No se pudo consultar el ticket."
+        );
+      })
+      .finally(() => {
+        if (!controlador.signal.aborted) {
+          setCargando(false);
+        }
+      });
+
+    return () => controlador.abort();
+  }, [id, intento, aplicarDetalle]);
+
+  function cerrar() {
+    if (!guardandoRef.current) {
+      onClose();
+    }
+  }
+
+  async function guardarAvance(
+    evento: FormEvent<HTMLFormElement>
+  ) {
+    evento.preventDefault();
+
+    if (guardandoRef.current || !fullTicket) return;
+
+    const estadoActual = normalizarEstado(fullTicket.estado);
+    const esRequerimiento =
+      fullTicket.tipo_llamada === "requerimiento" ||
+      fullTicket.ticketType === "requerimiento";
+
+    if (
+      !esRequerimiento ||
+      !estadoActual ||
+      estadoActual === "cerrado"
+    ) {
+      setError("Este ticket no admite modificaciones.");
       return;
     }
 
-    const controller = new AbortController();
-    fetchTicketDetails(targetId, controller.signal);
+    if (!comentario.trim()) {
+      setError("Ingrese una observación antes de guardar.");
+      return;
+    }
 
-    return () => controller.abort();
-  }, [targetId, fetchTicketDetails]);
+    const transferenciaActual =
+      fullTicket.estado_transferencia ?? null;
 
-  if (!ticket) return null;
+    const transferenciaNueva = llamadaTransferida
+      ? resultadoTransferencia
+      : null;
+
+    const cambioTransferencia =
+      transferenciaNueva !== transferenciaActual;
+
+    guardandoRef.current = true;
+    setGuardando(true);
+    setError("");
+    setMensajeExito("");
+
+    const controlador = new AbortController();
+    controladorGuardado.current = controlador;
+
+    let guardadoConfirmado = false;
+
+    try {
+      const respuesta = await fetch(
+        `/api/tickets/${encodeURIComponent(id)}`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          signal: controlador.signal,
+          body: JSON.stringify({
+            estado_actual: estadoActual,
+            estado: nuevoEstado,
+            comentario: comentario.trim(),
+
+            // Solo enviar la transferencia si fue modificada.
+            ...(cambioTransferencia
+              ? {
+                  estado_transferencia_actual:
+                    transferenciaActual,
+                  estado_transferencia:
+                    transferenciaNueva,
+                }
+              : {}),
+          }),
+        }
+      );
+
+      const datos = await respuesta.json();
+
+      if (!respuesta.ok || datos?.success !== true) {
+        throw new Error(
+          datos?.error ||
+            datos?.message ||
+            "No se pudo guardar el avance."
+        );
+      }
+
+      guardadoConfirmado = true;
+      setComentario("");
+      setMensajeExito(
+        "Cambios guardados y registrados en el historial."
+      );
+
+      const actualizado = await leerDetalle(
+        id,
+        controlador.signal
+      );
+
+      if (!controlador.signal.aborted) {
+        aplicarDetalle(actualizado);
+      }
+    } catch (errorGuardado: unknown) {
+      if (controlador.signal.aborted) return;
+
+      if (guardadoConfirmado) {
+        setFullTicket(null);
+        setError(
+          "Los cambios se guardaron, pero no se pudo recargar el detalle. Pulsa Recargar detalle."
+        );
+      } else {
+        setError(
+          errorGuardado instanceof Error
+            ? errorGuardado.message
+            : "No se pudo confirmar el guardado. Recarga el detalle antes de volver a enviarlo."
+        );
+      }
+    } finally {
+      guardandoRef.current = false;
+      controladorGuardado.current = null;
+
+      if (!controlador.signal.aborted) {
+        setGuardando(false);
+
+        if (guardadoConfirmado) {
+          onTicketUpdated?.();
+        }
+      }
+    }
+  }
 
   const activeTicket = fullTicket || ticket;
 
-  // Determinar anonimato de forma estricta
-  const isAnon = (() => {
-    if (activeTicket.es_anonimo === 1 || activeTicket.es_anonimo === true) return true;
-    const name = activeTicket.ciudadano || activeTicket.citizenName;
-    if (!name) return true;
-    const lowerName = name.trim().toLowerCase();
-    return lowerName.startsWith('anónimo') || lowerName.startsWith('anonimo');
-  })();
+  const estado = normalizarEstado(
+    activeTicket.estado || activeTicket.status
+  );
 
-  const numeroTicketDisplay = activeTicket.numero_ticket || `#${activeTicket.id}`;
-  const ciudadanoDisplay = activeTicket.ciudadano || activeTicket.citizenName || 'Anónimo';
-  const tipoLlamadaDisplay = activeTicket.tipo_llamada || activeTicket.ticketType || 'Consulta';
-  const departamentoDisplay = activeTicket.departamento || activeTicket.department || 'Sin Departamento Asignado';
-  const agenteDisplay = activeTicket.agente || 'Sin Agente Asignado';
-  const estadoDisplay = activeTicket.estado || activeTicket.status || 'Abierto';
-  const asuntoDisplay = activeTicket.asunto || activeTicket.subject || 'Sin asunto especificado';
-  const descripcionDisplay = activeTicket.detalles || activeTicket.descripcion || activeTicket.description;
+  const esRequerimiento =
+    activeTicket.tipo_llamada === "requerimiento" ||
+    activeTicket.ticketType === "requerimiento";
 
-  const normalState = estadoDisplay.toLowerCase().replace(' ', '_');
+  const editable =
+    !!fullTicket &&
+    esRequerimiento &&
+    estado !== null &&
+    estado !== "cerrado";
 
-  // Enviar el avance a la API
-  const handleGuardarAvance = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const esAnonimo =
+    activeTicket.es_anonimo === true ||
+    activeTicket.es_anonimo === 1;
 
-    if (!targetId || !comentarioAvance.trim()) return;
+  const numero =
+    activeTicket.numero_ticket || `#${activeTicket.id}`;
 
-    setSubmitting(true);
-    setMensajeExito(null);
+  const descripcion =
+    activeTicket.detalles ||
+    activeTicket.descripcion ||
+    activeTicket.description ||
+    "Sin descripción adicional.";
 
-    try {
-      const res = await fetch(`/api/tickets/${targetId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          estado: nuevoEstado,
-          comentario: comentarioAvance,
-        }),
-      });
+  const transferenciaActual =
+    activeTicket.estado_transferencia ?? null;
 
-      const data = await res.json();
-
-      if (data.success) {
-        setComentarioAvance('');
-        setMensajeExito('Avance registrado y estado actualizado correctamente.');
-        
-        // Recargar datos actualizados de MySQL
-        await fetchTicketDetails(targetId);
-
-        // Notificar a la vista principal
-        if (onTicketUpdated) onTicketUpdated();
-      } else {
-        alert(data.error || 'Error al actualizar el ticket.');
-      }
-    } catch (err) {
-      console.error('Error al guardar avance:', err);
-      alert('Ocurrió un error al intentar guardar el avance.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  // Formateador de fecha seguro
-  const formatDate = (dateStr?: string) => {
-    if (!dateStr) return null;
-    try {
-      return new Intl.DateTimeFormat('es-CL', {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }).format(new Date(dateStr));
-    } catch {
-      return dateStr;
-    }
-  };
+  const metadatos = [
+    [
+      "Ciudadano",
+      activeTicket.ciudadano ||
+        activeTicket.citizenName ||
+        "Anónimo",
+    ],
+    [
+      "Tipo de llamada / ticket",
+      esRequerimiento ? "Requerimiento" : "Consulta",
+    ],
+    [
+      "Departamento",
+      activeTicket.departamento ||
+        activeTicket.department ||
+        "Sin departamento asignado",
+    ],
+    [
+      "Agente responsable",
+      activeTicket.agente || "Registro del sistema",
+    ],
+  ];
 
   return (
-    <div 
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm animate-in fade-in duration-200"
-      onClick={onClose}
+    <dialog
+      ref={dialogo}
+      aria-labelledby="titulo-detalle-vecinal"
+      onCancel={(evento) => {
+        evento.preventDefault();
+        cerrar();
+      }}
+      style={{
+        margin: "auto",
+        width: "min(576px, calc(100vw - 32px))",
+        maxHeight: "90dvh",
+      }}
+      className="overflow-y-auto rounded-xl border border-slate-200 bg-white p-6 text-slate-900 shadow-2xl backdrop:bg-slate-900/50 backdrop:backdrop-blur-sm"
     >
-      <div 
-        className="relative w-full max-w-xl rounded-xl bg-card p-6 shadow-2xl border border-border bg-white text-gray-900 max-h-[90vh] overflow-y-auto"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header Modal */}
-        <div className="flex items-center justify-between border-b border-border pb-4">
-          <div className="flex items-center gap-2 font-bold text-lg text-gray-900">
-            <Eye className="h-5 w-5 text-[#2888EC]" />
-            <span>Detalle del Ticket {numeroTicketDisplay}</span>
-          </div>
-          <button
-            onClick={onClose}
-            className="rounded-lg p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
-          >
-            <X className="h-5 w-5" />
-          </button>
-        </div>
+      <div className="flex items-center justify-between gap-3 border-b border-slate-200 pb-4">
+        <h2
+          id="titulo-detalle-vecinal"
+          className="flex items-center gap-2 text-base font-bold"
+        >
+          <Eye className="h-5 w-5 shrink-0 text-[#2888EC]" />
+          Detalle del Ticket {numero}
+        </h2>
 
-        {/* Contenido del Ticket */}
-        {loading ? (
-          <div className="py-12 text-center text-sm font-medium text-gray-500">
-            Cargando detalles del ticket...
-          </div>
-        ) : (
-          <div className="mt-4 space-y-5 text-sm">
-            
-            {/* Grid de Metadatos */}
-            <div className="grid grid-cols-2 gap-4 rounded-xl bg-slate-50 p-4 border border-slate-100">
-              {/* Tipo Usuario */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Tipo Usuario</p>
-                {isAnon ? (
-                  <span className="inline-flex items-center gap-1 rounded-md bg-gray-100 border border-gray-200 px-2 py-0.5 text-xs font-semibold text-gray-600">
-                    <UserX className="h-3 w-3" />
-                    Anónimo
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 rounded-md bg-blue-50 border border-blue-200 px-2 py-0.5 text-xs font-semibold text-blue-700">
-                    <User className="h-3 w-3" />
-                    Registrado
+        <button
+          type="button"
+          onClick={cerrar}
+          disabled={guardando}
+          aria-label="Cerrar detalle"
+          className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 disabled:opacity-40"
+        >
+          <X className="h-5 w-5" />
+        </button>
+      </div>
+
+      {mensajeExito && (
+        <p
+          role="status"
+          className="mt-4 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800"
+        >
+          {mensajeExito}
+        </p>
+      )}
+
+      {error && (
+        <div
+          role="alert"
+          className="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+        >
+          <p>{error}</p>
+
+          {!guardando && !cargando && (
+            <button
+              type="button"
+              onClick={() => setIntento((actual) => actual + 1)}
+              className="mt-2 font-semibold underline"
+            >
+              Recargar detalle
+            </button>
+          )}
+        </div>
+      )}
+
+      {cargando ? (
+        <p
+          role="status"
+          className="py-12 text-center text-sm text-slate-500"
+        >
+          Cargando detalles del ticket…
+        </p>
+      ) : fullTicket ? (
+        <div className="mt-4 space-y-5 text-sm">
+          <dl className="grid grid-cols-1 gap-4 rounded-xl border border-slate-100 bg-slate-50 p-4 sm:grid-cols-2">
+            <div>
+              <dt className="mb-1 text-xs font-semibold uppercase text-slate-500">
+                Tipo usuario
+              </dt>
+              <dd>
+                <span className="rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700">
+                  {esAnonimo ? "Anónimo" : "Registrado"}
+                </span>
+              </dd>
+            </div>
+
+            {metadatos.map(([titulo, valor]) => (
+              <div key={titulo} className="min-w-0">
+                <dt className="mb-1 text-xs font-semibold uppercase text-slate-500">
+                  {titulo}
+                </dt>
+                <dd className="break-words font-medium">
+                  {valor}
+                </dd>
+              </div>
+            ))}
+
+            <div>
+              <dt className="mb-1 text-xs font-semibold uppercase text-slate-500">
+                Estado
+              </dt>
+              <dd>
+                {estado && (
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-semibold ${ESTADOS[estado].clase}`}
+                  >
+                    {ESTADOS[estado].nombre}
                   </span>
                 )}
-              </div>
-
-              {/* Ciudadano */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Ciudadano</p>
-                <p className="font-semibold text-gray-900">{ciudadanoDisplay}</p>
-              </div>
-
-              {/* Tipo de Llamada */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Tipo de Llamada / Ticket</p>
-                <p className="font-medium capitalize text-gray-800">
-                  {tipoLlamadaDisplay.replace('_', ' ')}
-                </p>
-              </div>
-
-              {/* Departamento */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Departamento</p>
-                <p className="font-medium text-gray-800">{departamentoDisplay}</p>
-              </div>
-
-              {/* Agente Responsable */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Agente Responsable</p>
-                <p className="font-medium text-gray-800">{agenteDisplay}</p>
-              </div>
-
-              {/* Estado */}
-              <div>
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Estado</p>
-                <span
-                  className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold capitalize ${
-                    normalState === 'abierto'
-                      ? 'bg-amber-100 text-amber-800'
-                      : normalState === 'en_proceso'
-                      ? 'bg-blue-100 text-blue-800'
-                      : 'bg-green-100 text-green-800'
-                  }`}
-                >
-                  {normalState === 'abierto' && <AlertCircle className="w-3 h-3" />}
-                  {normalState === 'en_proceso' && <Clock className="w-3 h-3" />}
-                  {normalState === 'cerrado' && <CheckCircle className="w-3 h-3" />}
-                  {estadoDisplay}
-                </span>
-              </div>
+              </dd>
             </div>
 
-            {/* Asunto */}
-            <div>
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Asunto</p>
-              <p className="mt-1 font-semibold text-gray-900 text-base">{asuntoDisplay}</p>
-            </div>
-
-            {/* Descripción / Detalles */}
-            <div>
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Descripción / Detalles</p>
-              <div className="mt-1 max-h-36 overflow-y-auto rounded-lg border border-gray-200 bg-gray-50/50 p-3 text-sm text-gray-700 leading-relaxed whitespace-pre-line">
-                {descripcionDisplay && descripcionDisplay.trim() !== ''
-                  ? descripcionDisplay
-                  : 'Sin descripción adicional.'}
+            {esRequerimiento && (
+              <div className="sm:col-span-2">
+                <dt className="mb-1 text-xs font-semibold uppercase text-slate-500">
+                  Llamada transferida
+                </dt>
+                <dd className="font-medium">
+                  {transferenciaActual
+                    ? TRANSFERENCIAS[transferenciaActual]
+                    : "No"}
+                </dd>
               </div>
-            </div>
+            )}
+          </dl>
 
-            {/* REGLA DE NEGOCIO: SOLO EDICIÓN PARA REQUERIMIENTOS ABIERTOS O EN PROCESO */}
-            {(() => {
-              const esRequerimiento = (activeTicket.tipo_llamada || '').toLowerCase().includes('requerimiento');
-              const estaCerrado = normalState === 'cerrado';
+          <section>
+            <h3 className="text-xs font-semibold uppercase text-slate-500">
+              Asunto
+            </h3>
+            <p className="mt-1 break-words font-semibold">
+              {activeTicket.asunto ||
+                activeTicket.subject ||
+                "Sin asunto"}
+            </p>
+          </section>
 
-              // CASO A: Consulta (Respuesta inmediata, solo lectura)
-              if (!esRequerimiento) {
-                return (
-                  <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-4 flex items-center gap-3">
-                    <CheckCircle className="w-5 h-5 text-blue-600 flex-shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold text-blue-900 uppercase">Consulta Rápida - Respuesta Inmediata</p>
-                      <p className="text-xs text-blue-700">Las consultas son resueltas inmediatamente y quedan en estado cerrado por defecto.</p>
-                    </div>
-                  </div>
-                );
-              }
+          <section>
+            <h3 className="text-xs font-semibold uppercase text-slate-500">
+              Descripción / Detalles
+            </h3>
+            <p className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-slate-200 bg-slate-50/50 p-3 leading-relaxed text-slate-700">
+              {descripcion}
+            </p>
+          </section>
 
-              // CASO B: Requerimiento Cerrado (Solo lectura)
-              if (estaCerrado) {
-                return (
-                  <div className="rounded-xl border border-green-200 bg-green-50 p-4 flex items-center gap-3">
-                    <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0" />
-                    <div>
-                      <p className="text-xs font-bold text-green-900 uppercase">Requerimiento Finalizado</p>
-                      <p className="text-xs text-green-700">Este requerimiento se encuentra cerrado. La bitácora ha sido archivada.</p>
-                    </div>
-                  </div>
-                );
-              }
+          {editable ? (
+            <form
+              onSubmit={guardarAvance}
+              className="rounded-xl border border-blue-200 bg-blue-50/50 p-4"
+            >
+              <h3 className="flex items-center gap-2 text-sm font-semibold text-blue-900">
+                <MessageSquarePlus className="h-4 w-4 shrink-0 text-[#2888EC]" />
+                Gestionar Requerimiento
+              </h3>
 
-              // CASO C: Requerimiento Abierto o En Proceso (Habilitar Edición)
-              return (
-                <form onSubmit={handleGuardarAvance} className="rounded-xl border border-blue-200 bg-blue-50/50 p-4 space-y-3">
-                  <div className="flex items-center gap-2 text-blue-900 font-semibold text-sm">
-                    <MessageSquarePlus className="w-4 h-4 text-[#2888EC]" />
-                    <span>Gestionar Requerimiento (Avance / Cambio de Estado)</span>
-                  </div>
+              <fieldset
+                disabled={guardando}
+                className="mt-3 space-y-4"
+              >
+                <div>
+                  <label
+                    htmlFor="gestion-estado"
+                    className="block text-xs font-semibold text-slate-700"
+                  >
+                    Nuevo Estado *
+                  </label>
+                  <select
+                    id="gestion-estado"
+                    value={nuevoEstado}
+                    onChange={(evento) =>
+                      setNuevoEstado(
+                        evento.target.value as Estado
+                      )
+                    }
+                    className={CLASE_CAMPO}
+                  >
+                    <option value="abierto">Abierto</option>
+                    <option value="en_proceso">En proceso</option>
+                    <option value="cerrado">Cerrado</option>
+                  </select>
+                </div>
 
-                  {mensajeExito && (
-                    <div className="text-xs font-medium text-green-700 bg-green-100 p-2 rounded-md">
-                      {mensajeExito}
+                <div className="rounded-lg border border-slate-200 bg-white p-3">
+                  <label
+                    htmlFor="gestion-transferida"
+                    className="flex cursor-pointer items-center gap-2 font-medium"
+                  >
+                    <input
+                      id="gestion-transferida"
+                      type="checkbox"
+                      checked={llamadaTransferida}
+                      onChange={(evento) => {
+                        const marcada = evento.target.checked;
+
+                        setLlamadaTransferida(marcada);
+
+                        if (
+                          marcada &&
+                          fullTicket.estado_transferencia == null
+                        ) {
+                          setResultadoTransferencia("pendiente");
+                        }
+                      }}
+                      className="h-4 w-4"
+                    />
+                    Llamada transferida
+                  </label>
+
+                  {llamadaTransferida && (
+                    <div className="mt-3">
+                      <label
+                        htmlFor="gestion-resultado"
+                        className="block text-xs font-semibold text-slate-700"
+                      >
+                        Resultado de la llamada *
+                      </label>
+                      <select
+                        id="gestion-resultado"
+                        value={resultadoTransferencia}
+                        onChange={(evento) =>
+                          setResultadoTransferencia(
+                            evento.target
+                              .value as ResultadoTransferencia
+                          )
+                        }
+                        className={CLASE_CAMPO}
+                      >
+                        <option value="pendiente">
+                          Pendiente de confirmar
+                        </option>
+                        <option value="exito">
+                          Llamada transferida con éxito
+                        </option>
+                        <option value="no_contestada">
+                          No contestada
+                        </option>
+                        <option value="devuelta">
+                          Llamada vuelta a mesa de ayuda
+                        </option>
+                      </select>
+
+                      <p className="mt-2 text-xs text-slate-500">
+                        Puede actualizar este resultado sin cambiar
+                        el estado del requerimiento.
+                      </p>
                     </div>
                   )}
-
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-700 mb-1">Nuevo Estado *</label>
-                    <select
-                      value={nuevoEstado}
-                      onChange={(e) => setNuevoEstado(e.target.value)}
-                      className="w-full rounded-md border border-gray-300 bg-white p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                      <option value="abierto">Abierto</option>
-                      <option value="en_proceso">En Proceso</option>
-                      <option value="cerrado">Cerrado</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-gray-700 mb-1">Comentario / Avance de Gestión *</label>
-                    <textarea
-                      rows={2}
-                      required
-                      value={comentarioAvance}
-                      onChange={(e) => setComentarioAvance(e.target.value)}
-                      placeholder="Describa las acciones realizadas o los avances pendientes..."
-                      className="w-full rounded-md border border-gray-300 bg-white p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                  </div>
-
-                  <div className="flex justify-end">
-                    <button
-                      type="submit"
-                      disabled={submitting}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#2888EC] hover:bg-[#1E72C6] text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 shadow-sm"
-                    >
-                      <Send className="w-3.5 h-3.5" />
-                      {submitting ? 'Guardando...' : 'Guardar Avance'}
-                    </button>
-                  </div>
-                </form>
-              );
-            })()}
-
-            {/* HISTORIAL / BITÁCORA DE AVANCES */}
-            {historial.length > 0 && (
-              <div className="space-y-2 pt-2 border-t border-gray-200">
-                <div className="flex items-center gap-2 font-semibold text-gray-700 text-xs uppercase tracking-wider">
-                  <History className="w-4 h-4 text-gray-500" />
-                  <span>Bitácora de Avances ({historial.length})</span>
                 </div>
-                <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                  {historial.map((h) => (
-                    <div key={h.id} className="rounded-lg border border-gray-200 bg-white p-2.5 text-xs space-y-1 shadow-sm">
-                      <div className="flex items-center justify-between text-gray-500">
-                        <span className="font-semibold text-gray-700">{h.agente}</span>
-                        <span>{formatDate(h.fecha_registro)}</span>
-                      </div>
-                      <p className="text-gray-800 text-sm">{h.comentario}</p>
-                      <div className="text-[11px] text-gray-400 pt-1 border-t border-gray-100">
-                        Cambio: <span className="capitalize">{h.estado_anterior || 'Inicio'}</span> &rarr; <span className="font-semibold capitalize text-blue-600">{h.estado_nuevo}</span>
-                      </div>
+
+                <div>
+                  <label
+                    htmlFor="gestion-comentario"
+                    className="block text-xs font-semibold text-slate-700"
+                  >
+                    Comentario / Avance de Gestión *
+                  </label>
+                  <textarea
+                    id="gestion-comentario"
+                    rows={3}
+                    required
+                    maxLength={4000}
+                    value={comentario}
+                    onChange={(evento) =>
+                      setComentario(evento.target.value)
+                    }
+                    placeholder="Describa las acciones realizadas o el resultado de la llamada…"
+                    className={CLASE_CAMPO}
+                  />
+                </div>
+
+                {nuevoEstado === "cerrado" && (
+                  <p className="text-xs text-slate-600">
+                    Al cerrar el requerimiento quedará de solo lectura,
+                    incluido el resultado de la transferencia.
+                  </p>
+                )}
+
+                <div className="flex justify-end">
+                  <button
+                    type="submit"
+                    disabled={guardando || !comentario.trim()}
+                    className="inline-flex items-center gap-2 rounded-lg bg-[#2888EC] px-4 py-2 text-sm font-semibold text-white hover:bg-[#1E72C6] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Send className="h-4 w-4" />
+                    {guardando ? "Guardando…" : "Guardar Avance"}
+                  </button>
+                </div>
+              </fieldset>
+            </form>
+          ) : (
+            <div className="rounded-xl border border-green-200 bg-green-50 p-4 text-sm text-green-800">
+              {esRequerimiento
+                ? "Este requerimiento está cerrado y es de solo lectura."
+                : "Esta consulta fue cerrada automáticamente al registrarse y es de solo lectura."}
+            </div>
+          )}
+
+          <section className="border-t border-slate-200 pt-4">
+            <h3 className="flex items-center gap-2 text-xs font-semibold uppercase text-slate-600">
+              <History className="h-4 w-4" />
+              Historial de gestión ({historial.length})
+            </h3>
+
+            {!historial.length ? (
+              <p className="mt-3 text-sm text-slate-500">
+                No hay movimientos registrados.
+              </p>
+            ) : (
+              <ol className="mt-3 max-h-64 space-y-3 overflow-y-auto pr-1">
+                {historial.map((movimiento) => (
+                  <li
+                    key={movimiento.id}
+                    className="rounded-lg border border-slate-200 bg-white p-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-xs font-bold text-blue-700">
+                        {EVENTOS[movimiento.tipo_evento || ""] ||
+                          "Movimiento registrado"}
+                      </p>
+                      <time className="text-xs text-slate-500">
+                        {mostrarFecha(movimiento.fecha_registro)}
+                      </time>
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
 
-            {/* Fecha de Creación */}
-            {activeTicket.fecha_creacion && (
-              <div className="flex items-center gap-1.5 text-xs text-gray-400 pt-1">
-                <Calendar className="w-3.5 h-3.5" />
-                <span>Creado el: {formatDate(activeTicket.fecha_creacion)}</span>
-              </div>
+                    <p className="mt-2 whitespace-pre-wrap break-words text-sm text-slate-700">
+                      {movimiento.comentario}
+                    </p>
+
+                    <p className="mt-2 text-xs text-slate-500">
+                      Estado:{" "}
+                      {mostrarEstado(movimiento.estado_anterior)}
+                      {" → "}
+                      {mostrarEstado(movimiento.estado_nuevo)}
+                    </p>
+
+                    {movimiento.tipo_evento === "derivacion" && (
+                      <p className="mt-1 text-xs text-slate-500">
+                        Departamento:{" "}
+                        {movimiento.departamento_anterior_nombre ||
+                          "Sin departamento"}
+                        {" → "}
+                        {movimiento.departamento_nuevo_nombre ||
+                          "Sin departamento"}
+                      </p>
+                    )}
+
+                    <p className="mt-1 text-xs font-medium text-slate-500">
+                      {movimiento.agente || "Registro del sistema"}
+                    </p>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </section>
+
+          <div className="space-y-1 text-xs text-slate-400">
+            <p className="flex items-center gap-1.5">
+              <Calendar className="h-3.5 w-3.5" />
+              Creado el:{" "}
+              {mostrarFecha(activeTicket.fecha_creacion)}
+            </p>
+
+            {activeTicket.fecha_cierre && (
+              <p>
+                Cerrado el:{" "}
+                {mostrarFecha(activeTicket.fecha_cierre)}
+              </p>
             )}
           </div>
-        )}
-
-        {/* Footer */}
-        <div className="mt-6 flex justify-end border-t border-border pt-4">
-          <button
-            onClick={onClose}
-            className="rounded-lg bg-[#2888EC] px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-[#1E72C6] shadow-sm"
-          >
-            Cerrar
-          </button>
         </div>
+      ) : null}
+
+      <div className="mt-6 flex justify-end border-t border-slate-200 pt-4">
+        <button
+          type="button"
+          onClick={cerrar}
+          disabled={guardando}
+          className="rounded-lg bg-[#2888EC] px-4 py-2 text-sm font-semibold text-white hover:bg-[#1E72C6] disabled:opacity-50"
+        >
+          Cerrar
+        </button>
       </div>
-    </div>
+    </dialog>
   );
 }
